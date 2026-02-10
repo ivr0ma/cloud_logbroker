@@ -1,0 +1,17 @@
+[Unit]
+Description=Logbroker service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/logbroker
+Environment="CLICKHOUSE_HOST=10.2.0.24"
+Environment="BUFFER_PATH=/var/lib/logbroker/buffer.log"
+ExecStart=/home/ubuntu/logbroker/venv/bin/uvicorn main:app --host 0.0.0.0 --port 80
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
