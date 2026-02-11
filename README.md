@@ -129,7 +129,7 @@ ssh hw2-logbroker-2
 Скопировать скрипт установки:
 
 ```bash
-scp -o ProxyJump=hw2-nat scripts/setup_clickhouse.sh ubuntu@10.2.0.24:~/
+scp scripts/setup_clickhouse.sh hw2-clickhouse:~/
 ```
 
 Запустить:
@@ -204,13 +204,11 @@ GRANT INSERT, SELECT ON default.logs TO logbroker;
 С локальной машины:
 
 ```bash
-NAT=89.169.181.22
+scp -r logbroker hw2-logbroker-1:~/
+scp -r logbroker hw2-logbroker-2:~/
 
-scp -o ProxyJump=ubuntu@$NAT -r logbroker ubuntu@10.2.0.20:~/
-scp -o ProxyJump=ubuntu@$NAT -r logbroker ubuntu@10.2.0.22:~/
-
-scp -o ProxyJump=ubuntu@$NAT scripts/setup_logbroker.sh ubuntu@10.2.0.20:~/
-scp -o ProxyJump=ubuntu@$NAT scripts/setup_logbroker.sh ubuntu@10.2.0.22:~/
+scp scripts/setup_logbroker.sh hw2-logbroker-1:~/
+scp scripts/setup_logbroker.sh hw2-logbroker-2:~/
 ```
 
 #### 5.2. Установка и запуск на 10.2.0.20
@@ -248,6 +246,7 @@ ssh hw2-logbroker-2
 chmod +x setup_logbroker.sh
 
 LOGBROKER_DIR=/home/ubuntu/logbroker \
+CLICKHOUSE_HOST=10.2.0.20 \
 CLICKHOUSE_USER=logbroker \
 CLICKHOUSE_PASSWORD=logbroker \
 ./setup_logbroker.sh
@@ -276,8 +275,8 @@ sudo rm -f /etc/nginx/sites-enabled/default
 ```bash
 sudo tee /etc/nginx/conf.d/logbroker.conf > /dev/null << 'EOF'
 upstream logbroker_backends {
-    server 10.2.0.20:80;
-    server 10.2.0.22:80;
+    server 10.2.0.23:80;
+    server 10.2.0.25:80;
 }
 
 server {
