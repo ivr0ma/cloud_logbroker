@@ -72,262 +72,84 @@ terraform output
 
 ---
 
-### 2. NAT‑инстанс (jump‑host и выход в интернет)
+### 2. Что делает `terraform apply`
 
-Подключение к NAT:
+Один `terraform apply` поднимает и настраивает всю инфраструктуру и софт:
 
-```bash
-ssh ubuntu@89.169.181.22
-```
+- **VPC и сеть**: отдельная сеть, публичная и приватная подсети, таблица маршрутизации.
+- **NAT‑инстанс**:
+  - Включается IP‑forwarding.
+  - Вешается iptables‑правило `MASQUERADE` для подсети `10.2.0.0/24`.
+  - Приватные ВМ получают доступ в интернет.
+- **ClickHouse‑ВМ**:
+  - Устанавливается Docker.
+  - Поднимается контейнер `clickhouse/clickhouse-server`.
+  - Создаётся база/таблица `default.logs`.
+  - Создаётся пользователь `logbroker` с паролем `logbroker` и правами `INSERT, SELECT` на `default.logs`.
+- **Две backend‑ВМ с logbroker**:
+  - Копируется каталог `logbroker/` и скрипт `scripts/setup_logbroker.sh`.
+  - Устанавливается Python, создаётся `venv`, ставятся зависимости.
+  - Создаётся каталог `/var/lib/logbroker` под персистентный буфер.
+  - Разворачивается и запускается `systemd`‑сервис `logbroker` на порту 80.
+  - В сервис пробрасываются переменные окружения `CLICKHOUSE_HOST`, `CLICKHOUSE_USER=logbroker`, `CLICKHOUSE_PASSWORD=logbroker`.
+- **nginx‑ВМ**:
+  - Устанавливается nginx.
+  - Удаляется дефолтный сайт.
+  - Создаётся конфиг `logbroker.conf` с `upstream` на два backend‑инстанса.
+  - Включаются маршруты `/nginx_health` и проксирование всех остальных запросов на logbroker.
 
-На NAT‑инстансе включить IP‑forwarding и NAT:
-
-```bash
-sudo sysctl -w net.ipv4.ip_forward=1
-echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.d/99-nat.conf
-
-sudo iptables -t nat -A POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE
-```
-
-Теперь приватные ВМ могут выходить в интернет через NAT.
-
-Удобная конфигурация SSH (`~/.ssh/config` на локальной машине):
-
-```sshconfig
-Host hw2-nat
-  HostName 89.169.181.22
-  User ubuntu
-
-Host hw2-clickhouse
-  HostName 10.2.0.24
-  User ubuntu
-  ProxyJump hw2-nat
-
-Host hw2-logbroker-1
-  HostName 10.2.0.20
-  User ubuntu
-  ProxyJump hw2-nat
-
-Host hw2-logbroker-2
-  HostName 10.2.0.22
-  User ubuntu
-  ProxyJump hw2-nat
-```
-
-После этого можно подключаться как:
-
-```bash
-ssh hw2-clickhouse
-ssh hw2-logbroker-1
-ssh hw2-logbroker-2
-```
+Никаких ручных запусков `setup_*.sh` делать не нужно: Terraform сам копирует и выполняет скрипты по SSH.
 
 ---
 
-### 3. Установка ClickHouse
+### 3. Проверка инфраструктуры
 
-Скопировать скрипт установки:
-
-```bash
-scp scripts/setup_clickhouse.sh hw2-clickhouse:~/
-```
-
-Запустить:
+После `terraform apply` можно посмотреть ключевые параметры:
 
 ```bash
-ssh hw2-clickhouse 'chmod +x setup_clickhouse.sh && ./setup_clickhouse.sh'
+terraform output
 ```
 
-Скрипт:
+Важно:
 
-- устанавливает Docker,
-- создаёт директорию `/home/ubuntu/logbroker_clickhouse_database`,
-- поднимает контейнер ClickHouse (`clickhouse/clickhouse-server`),
-- создаёт таблицу:
+- `nginx_public_ip` — публичный IP nginx‑балансировщика.
+- `nat_instance_public_ip` — публичный IP NAT/jump‑host.
+- `clickhouse_private_ip` — приватный IP ClickHouse.
+- `logbroker_private_ips` — приватные IP двух backend‑ВМ.
 
-```sql
-CREATE TABLE IF NOT EXISTS default.logs
-(
-    ts      DateTime,
-    message String
-)
-ENGINE = MergeTree()
-ORDER BY ts;
-```
-
-Проверка:
-
-На ВМ ClickHouse (`10.2.0.24`):
+Быстрая проверка nginx:
 
 ```bash
-ssh hw2-clickhouse
+curl http://$(terraform output -raw nginx_public_ip)/nginx_health
+curl http://$(terraform output -raw nginx_public_ip)/health
 ```
 
+Проверка ClickHouse:
+
 ```bash
+ssh -J ubuntu@$(terraform output -raw nat_instance_public_ip) ubuntu@$(terraform output -raw clickhouse_private_ip)
+
 curl http://localhost:8123/ping
-# Должно вернуть: Ok.
-
 sudo docker exec -it clickhouse-server clickhouse-client -q "SHOW TABLES FROM default"
-# Должно быть: logs
 ```
+
+Ожидается таблица `logs`.
 
 ---
 
-### 4. Пользователь для logbroker в ClickHouse
+### 4. End‑to‑end проверка логов
 
-На `10.2.0.24`:
-
-```bash
-ssh hw2-clickhouse
-sudo docker exec -it clickhouse-server clickhouse-client
-```
-
-Внутри клиента:
-
-```sql
-CREATE USER logbroker IDENTIFIED BY 'logbroker';
-GRANT INSERT, SELECT ON default.logs TO logbroker;
-```
-
----
-
-### 5. Развёртывание logbroker на двух backend‑ВМ
-
-Приложение находится в каталоге `logbroker/`:
-
-- FastAPI‑приложение (`main.py`),
-- персистентный буфер (`buffer.py`), пишущий в файл и раз в секунду отправляющий батчи в ClickHouse,
-- конфиг через переменные окружения (`config.py`).
-
-#### 5.1. Копирование кода и скрипта
-
-С локальной машины:
+С локальной машины отправить логи через nginx:
 
 ```bash
-scp -r logbroker hw2-logbroker-1:~/
-scp -r logbroker hw2-logbroker-2:~/
-
-scp scripts/setup_logbroker.sh hw2-logbroker-1:~/
-scp scripts/setup_logbroker.sh hw2-logbroker-2:~/
-```
-
-#### 5.2. Установка и запуск на 10.2.0.20
-
-```bash
-ssh hw2-logbroker-1
-chmod +x setup_logbroker.sh
-
-LOGBROKER_DIR=/home/ubuntu/logbroker \
-CLICKHOUSE_USER=logbroker \
-CLICKHOUSE_PASSWORD=logbroker \
-./setup_logbroker.sh
-
-sudo systemctl restart logbroker
-sudo journalctl -u logbroker -n 10 --no-pager
-```
-
-Скрипт:
-
-- устанавливает `python3`, `pip`, `venv`,
-- создаёт виртуальное окружение и ставит зависимости из `logbroker/requirements.txt`,
-- создаёт каталог `/var/lib/logbroker` под буфер,
-- разворачивает и запускает `systemd`‑сервис `logbroker` на порту 80.
-
-Проверка:
-
-```bash
-curl -s http://localhost/health
-```
-
-Аналогично на `10.2.0.22`:
-
-```bash
-ssh hw2-logbroker-2
-chmod +x setup_logbroker.sh
-
-LOGBROKER_DIR=/home/ubuntu/logbroker \
-CLICKHOUSE_HOST=10.2.0.20 \
-CLICKHOUSE_USER=logbroker \
-CLICKHOUSE_PASSWORD=logbroker \
-./setup_logbroker.sh
-
-sudo systemctl restart logbroker
-sudo journalctl -u logbroker -n 10 --no-pager
-curl -s http://localhost/health
-```
-
----
-
-### 6. Настройка nginx‑балансировщика
-
-На ВМ nginx (`nginx_public_ip`, в примере `89.169.188.57`):
-
-```bash
-ssh ubuntu@89.169.188.57
-sudo apt-get update
-sudo apt-get install -y nginx
-
-sudo rm -f /etc/nginx/sites-enabled/default
-```
-
-Создать конфиг `/etc/nginx/conf.d/logbroker.conf`:
-
-```bash
-sudo tee /etc/nginx/conf.d/logbroker.conf > /dev/null << 'EOF'
-upstream logbroker_backends {
-    server 10.2.0.23:80;
-    server 10.2.0.25:80;
-}
-
-server {
-    listen 80;
-    server_name _;
-
-    location /nginx_health {
-        return 200 "ok";
-        add_header Content-Type text/plain;
-    }
-
-    location / {
-        proxy_pass http://logbroker_backends;
-
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        proxy_connect_timeout 5s;
-        proxy_read_timeout 60s;
-    }
-}
-EOF
-
-sudo nginx -t
-sudo systemctl restart nginx
-sudo systemctl enable nginx
-```
-
-Проверки:
-
-```bash
-curl http://89.169.188.57/nginx_health
-curl http://89.169.188.57/health
-```
-
----
-
-### 7. End‑to‑end проверка логов
-
-С локальной машины отправить логи:
-
-```bash
-curl -X POST http://89.169.188.57/write_log -d $'first log via nginx\nsecond log via nginx'
+curl -X POST "http://$(terraform output -raw nginx_public_ip)/write_log" \
+  -d $'first log via nginx\nsecond log via nginx'
 ```
 
 Через несколько секунд проверить в ClickHouse:
 
 ```bash
-ssh hw2-clickhouse
+ssh -J ubuntu@$(terraform output -raw nat_instance_public_ip) ubuntu@$(terraform output -raw clickhouse_private_ip)
 sudo docker exec -it clickhouse-server clickhouse-client -q "SELECT count(), any(message) FROM default.logs"
 ```
 
@@ -335,7 +157,7 @@ sudo docker exec -it clickhouse-server clickhouse-client -q "SELECT count(), any
 
 ---
 
-### 8. Кратко про гарантию доставки
+### 5. Кратко про гарантию доставки
 
 Logbroker:
 
