@@ -28,6 +28,12 @@ variable "ssh_public_key" {
   sensitive   = true
 }
 
+variable "ssh_private_key_path" {
+  description = "Path to SSH private key that matches ssh_public_key"
+  type        = string
+  default     = "~/.ssh/id_ed25519"
+}
+
 # Provider for yandex cloud
 provider "yandex" {
   cloud_id  = var.cloud_id
@@ -103,6 +109,29 @@ resource "yandex_compute_instance" "nat_instance" {
 
   metadata = {
     ssh-keys = "ubuntu:${var.ssh_public_key}"
+  }
+}
+
+########################
+## PROVISIONING: NAT (IP forwarding + MASQUERADE)
+########################
+
+resource "null_resource" "setup_nat" {
+  triggers = {
+    nat_ip = yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address
+  }
+
+  provisioner "local-exec" {
+    working_dir = path.module
+
+    command = <<-EOT
+      set -e
+      NAT_IP="${yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address}"
+      SSH_KEY="${var.ssh_private_key_path}"
+
+      echo "==> Настраиваю NAT-инстанс (IP forward + MASQUERADE)..."
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no ubuntu@"$NAT_IP" "sudo sysctl -w net.ipv4.ip_forward=1 && echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-nat.conf >/dev/null && sudo iptables -t nat -C POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE"
+    EOT
   }
 }
 
@@ -223,6 +252,152 @@ resource "yandex_compute_instance" "clickhouse" {
 
   metadata = {
     ssh-keys = "ubuntu:${var.ssh_public_key}"
+  }
+}
+
+########################
+## PROVISIONING: CLICKHOUSE
+########################
+
+resource "null_resource" "setup_clickhouse" {
+  # Перезапускать провижининг, если меняется приватный IP (пересоздание ВМ)
+  triggers = {
+    clickhouse_ip = yandex_compute_instance.clickhouse.network_interface[0].ip_address
+    nat_ip        = yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address
+    script_rev    = "v2"
+  }
+
+  # Нужен рабочий NAT, чтобы ClickHouse‑ВМ имела доступ в интернет
+  depends_on = [null_resource.setup_nat]
+
+  provisioner "local-exec" {
+    working_dir = path.module
+
+    command = <<-EOT
+      set -e
+      NAT_IP="${yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address}"
+      CLICKHOUSE_IP="${yandex_compute_instance.clickhouse.network_interface[0].ip_address}"
+      SSH_KEY="${var.ssh_private_key_path}"
+
+      echo "==> Копирую setup_clickhouse.sh на ВМ ClickHouse..."
+      scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" scripts/setup_clickhouse.sh ubuntu@"$CLICKHOUSE_IP":/home/ubuntu/
+
+      echo "==> Запускаю setup_clickhouse.sh на ВМ ClickHouse..."
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" ubuntu@"$CLICKHOUSE_IP" "bash ./setup_clickhouse.sh"
+    EOT
+  }
+}
+
+########################
+## PROVISIONING: LOGBROKER-1
+########################
+
+resource "null_resource" "setup_logbroker_1" {
+  triggers = {
+    logbroker_ip = yandex_compute_instance.logbroker_1.network_interface[0].ip_address
+    nat_ip       = yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address
+    clickhouse_ip = yandex_compute_instance.clickhouse.network_interface[0].ip_address
+  }
+
+  # Гарантируем, что NAT и ClickHouse настроены до запуска logbroker
+  depends_on = [
+    null_resource.setup_nat,
+    null_resource.setup_clickhouse
+  ]
+
+  provisioner "local-exec" {
+    working_dir = path.module
+
+    command = <<-EOT
+      set -e
+      NAT_IP="${yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address}"
+      LOGBROKER_IP="${yandex_compute_instance.logbroker_1.network_interface[0].ip_address}"
+      CLICKHOUSE_IP="${yandex_compute_instance.clickhouse.network_interface[0].ip_address}"
+      SSH_KEY="${var.ssh_private_key_path}"
+
+      echo "==> Копирую приложение logbroker на ВМ logbroker-1..."
+      scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" -r logbroker ubuntu@"$LOGBROKER_IP":/home/ubuntu/
+
+      echo "==> Копирую setup_logbroker.sh на ВМ logbroker-1..."
+      scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" scripts/setup_logbroker.sh ubuntu@"$LOGBROKER_IP":/home/ubuntu/
+
+      echo "==> Запускаю setup_logbroker.sh на ВМ logbroker-1..."
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" ubuntu@"$LOGBROKER_IP" "CLICKHOUSE_HOST=$CLICKHOUSE_IP bash ./setup_logbroker.sh /home/ubuntu/logbroker"
+    EOT
+  }
+}
+
+########################
+## PROVISIONING: LOGBROKER-2
+########################
+
+resource "null_resource" "setup_logbroker_2" {
+  triggers = {
+    logbroker_ip = yandex_compute_instance.logbroker_2.network_interface[0].ip_address
+    nat_ip       = yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address
+    clickhouse_ip = yandex_compute_instance.clickhouse.network_interface[0].ip_address
+  }
+
+  depends_on = [
+    null_resource.setup_nat,
+    null_resource.setup_clickhouse
+  ]
+
+  provisioner "local-exec" {
+    working_dir = path.module
+
+    command = <<-EOT
+      set -e
+      NAT_IP="${yandex_compute_instance.nat_instance.network_interface[0].nat_ip_address}"
+      LOGBROKER_IP="${yandex_compute_instance.logbroker_2.network_interface[0].ip_address}"
+      CLICKHOUSE_IP="${yandex_compute_instance.clickhouse.network_interface[0].ip_address}"
+      SSH_KEY="${var.ssh_private_key_path}"
+
+      echo "==> Копирую приложение logbroker на ВМ logbroker-2..."
+      scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" -r logbroker ubuntu@"$LOGBROKER_IP":/home/ubuntu/
+
+      echo "==> Копирую setup_logbroker.sh на ВМ logbroker-2..."
+      scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" scripts/setup_logbroker.sh ubuntu@"$LOGBROKER_IP":/home/ubuntu/
+
+      echo "==> Запускаю setup_logbroker.sh на ВМ logbroker-2..."
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@"$NAT_IP" ubuntu@"$LOGBROKER_IP" "CLICKHOUSE_HOST=$CLICKHOUSE_IP bash ./setup_logbroker.sh /home/ubuntu/logbroker"
+    EOT
+  }
+}
+
+########################
+## PROVISIONING: NGINX
+########################
+
+resource "null_resource" "setup_nginx" {
+  triggers = {
+    nginx_ip       = yandex_compute_instance.nginx.network_interface[0].nat_ip_address
+    logbroker_1_ip = yandex_compute_instance.logbroker_1.network_interface[0].ip_address
+    logbroker_2_ip = yandex_compute_instance.logbroker_2.network_interface[0].ip_address
+  }
+
+  # nginx должен настраиваться после того, как оба backend‑а подняты и настроены
+  depends_on = [
+    null_resource.setup_logbroker_1,
+    null_resource.setup_logbroker_2
+  ]
+
+  provisioner "local-exec" {
+    working_dir = path.module
+
+    command = <<-EOT
+      set -e
+      NGINX_IP="${yandex_compute_instance.nginx.network_interface[0].nat_ip_address}"
+      LOGBROKER_1_IP="${yandex_compute_instance.logbroker_1.network_interface[0].ip_address}"
+      LOGBROKER_2_IP="${yandex_compute_instance.logbroker_2.network_interface[0].ip_address}"
+      SSH_KEY="${var.ssh_private_key_path}"
+
+      echo "==> Копирую setup_nginx.sh на ВМ nginx..."
+      scp -i "$SSH_KEY" -o StrictHostKeyChecking=no scripts/setup_nginx.sh ubuntu@"$NGINX_IP":/home/ubuntu/
+
+      echo "==> Запускаю setup_nginx.sh на ВМ nginx..."
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no ubuntu@"$NGINX_IP" "LOGBROKER_1=$LOGBROKER_1_IP LOGBROKER_2=$LOGBROKER_2_IP bash ./setup_nginx.sh"
+    EOT
   }
 }
 

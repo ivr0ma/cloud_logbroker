@@ -51,5 +51,11 @@ ENGINE = MergeTree()
 ORDER BY ts;
 "
 
+echo "==> Создание пользователя logbroker и прав..."
+sudo docker exec clickhouse-server clickhouse-client -q "
+CREATE USER IF NOT EXISTS logbroker IDENTIFIED BY 'logbroker';
+GRANT INSERT, SELECT ON default.logs TO logbroker;
+"
+
 echo "==> Готово. ClickHouse слушает порты 8123 (HTTP) и 9000 (native)."
 echo "Проверка: curl http://localhost:8123/ping"
