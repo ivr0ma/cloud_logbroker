@@ -133,7 +133,7 @@ resource "null_resource" "setup_nat" {
       echo "==> Ожидаю, пока SSH на NAT-инстансе станет доступен..."
 
       # Ждём, пока SSH-порт поднимется (до 5 минут, 30 попыток по 10 секунд)
-      for i in {1..30}; do
+      for i in $(seq 1 30); do
         if ssh -i "$SSH_KEY" \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=5 \
