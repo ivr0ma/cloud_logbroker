@@ -130,7 +130,25 @@ resource "null_resource" "setup_nat" {
       SSH_KEY="${var.ssh_private_key_path}"
 
       echo "==> Настраиваю NAT-инстанс (IP forward + MASQUERADE)..."
-      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no ubuntu@"$NAT_IP" "sudo sysctl -w net.ipv4.ip_forward=1 && echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-nat.conf >/dev/null && sudo iptables -t nat -C POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE"
+      echo "==> Ожидаю, пока SSH на NAT-инстансе станет доступен..."
+
+      # Ждём, пока SSH-порт поднимется (до 5 минут, 30 попыток по 10 секунд)
+      for i in {1..30}; do
+        if ssh -i "$SSH_KEY" \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=5 \
+              ubuntu@"$NAT_IP" \
+              "sudo sysctl -w net.ipv4.ip_forward=1 && echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-nat.conf >/dev/null && sudo iptables -t nat -C POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE"; then
+          echo "==> NAT-инстанс успешно настроен."
+          exit 0
+        fi
+
+        echo "==> SSH ещё недоступен, попытка $i/30, жду 10 секунд..."
+        sleep 10
+      done
+
+      echo "==> Не удалось настроить NAT-инстанс: SSH так и не стал доступен."
+      exit 1
     EOT
   }
 }
